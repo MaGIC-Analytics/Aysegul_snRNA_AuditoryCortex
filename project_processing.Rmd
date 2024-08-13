@@ -1,0 +1,949 @@
+---
+title: "scRNA experiment report- Experiment for Aysegul"
+output:
+  html_notebook:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Experiment
+
+This experiment was designed as a first stage project to evaluate Parse snRNA preps within the auditory cortex. 
+
+All execution is performed in containerized environment and recorded in markdown for reproducibility. The container can be launched with `docker run --rm 8787:8787 -e PASSWORD=$PASS -v $PWD:/home/rstudio alemenze/abrfseurat`, and accessed with [localhost:8787](https://www.youtube.com/watch?v=dQw4w9WgXcQ)
+
+```{r Libraries,  warning=FALSE, message=FALSE, results='hide'}
+#Basic manipulations
+library(knitr)
+library(tidyverse)
+library(tibble)
+library(dplyr)
+library(hdf5r)
+library(cowplot)
+library(ggplot2)
+library(ggalt)
+library(ggrepel)
+library(ggpubr)
+library(Matrix)
+library(purrr)
+library(reshape2)
+library(RColorBrewer)
+library(patchwork)
+library(magrittr)
+library(clustree)
+library(Matrix.utils)
+library(DT)
+
+#scRNA core packages
+library(Seurat)
+library(S4Vectors)
+library(scRNAseq)
+library(SeuratWrappers)
+library(SingleCellExperiment)
+library(dittoSeq)
+library(scDataviz)
+library(DropletQC)
+library(scCustomize)
+library(glmGamPoi)
+library(VAM)
+
+
+#scRNA velocity, pseudotime, annotations, doublets
+library(monocle3)
+library(velocyto.R)
+library(slingshot)
+library(SingleR)
+library(DoubletFinder)
+library(SoupX)
+
+#Other random packages for pseudobulk or things I like to use
+library(apeglm)
+library(scater)
+library(magrittr)
+library(pheatmap)
+library(ComplexHeatmap)
+library(DESeq2)
+library(edgeR)
+library(EnhancedVolcano)
+library(PCAtools)
+library(clusterProfiler)
+
+options(future.globals.maxSize=100000*1024^2)
+install.packages('UpSetR')
+install.packages('VennDiagram')
+```
+
+### Sample ingress
+
+To load the samples into R, we first start with the raw matrix files from the parse pipeline. I **strongly** recommend starting from the raw matrices. Raw matrices will allow you to more agnostically filter when doing cross platform studies, perform soup reductions, and can reduce cell callers bias against granulocyte cell calling (not relevant here but still). We start with the full collection of droplets/encapsulated nuclei, and this will be performed sample-by-sample for instructional ease. and any minor tweaks we need to make for single samples. 
+
+```{r Ingress, warning=FALSE, message=FALSE, fig.align="center",results='hide', fig.height = 16, fig.width = 10}
+###############################################
+
+control.raw <- ReadParseBio('./input_data/Control//DGE_unfiltered/')
+control <- CreateSeuratObject(control.raw, min.features=2)
+counts <- GetAssayData(object = control, slot = "counts")
+nonzero <- counts > 0
+keep_genes <- Matrix::rowSums(nonzero) >= 10
+filtered_counts <- counts[keep_genes, ]
+control <- CreateSeuratObject(filtered_counts, meta.data=control@meta.data, project='control', assay='RNA')
+
+control@meta.data$samp <- 'Control'
+
+control.raw <- control
+control[['percent.mito']] <- PercentageFeatureSet(control, pattern='^Mt-')
+control[['percent.ribo']] <- PercentageFeatureSet(control,pattern='^Rp[sl][[:digit:]]')
+control[['percent.hb']] <- PercentageFeatureSet(control, pattern = "^hbb|hba")
+
+#Make a quick plot of the input QC
+prefilt_plot <- VlnPlot(control, features=c('nFeature_RNA','nCount_RNA','percent.mito','percent.ribo','percent.hb'), ncol=1, group.by='samp', raster=F)
+
+prefilt_plot
+```
+
+### Filtering
+
+A critical part of data ingress is filtering the data, and required for all types of samples. The old adage still stands strong- garbage in = garbage out. We can see just from above that there are `r length(WhichCells(control))` droplets total with captured nucleotides. The often majority are junk droplets with random floating nucleotides in the solution (aka the soup)- which we can filter out. 
+
+In this case we start with a fairly light filter, removing those which are more likely true noise or degraded. 
+
+```{r Filter, warning=FALSE, message=FALSE, fig.align="center",results='hide', fig.height = 16, fig.width = 10}
+# Remove all droplets with >7000 features, strong likelihood of homotypic doublets
+# Remove all droplets with <100 features, likely noise
+# Remove all droplets with <1000 counts of RNA, low capture droplets
+# Remove all droplets with >10% mitochondrial content, likely dead/dying cells
+# Remove all droplets with >45% ribosomal and 20% hemoglobin- likely just mess droplets
+
+control <- subset (control, subset= nFeature_RNA < 7000 & percent.mito < 10 & percent.ribo < 45 & nCount_RNA > 1000 & nFeature_RNA > 100 & percent.hb < 20)
+
+#Make a quick plot of the input QC
+postfilt_plot <- VlnPlot(control, features=c('nFeature_RNA','nCount_RNA','percent.mito','percent.ribo','percent.hb'), ncol=1, group.by='samp',raster=F)
+
+postfilt_plot
+```
+
+At the end of the filtering stages, we now have a final of `r length(WhichCells(control))` droplets that we can support as cells. 
+
+### Soup reduction
+
+As mentioned before, there are ambient nucleotides in the solution that get captured as "droplets". We identified droplets we defined as "noise" earlier, so now we can attempt to correct this issue. 
+
+```{r Soup, warning=FALSE, message=FALSE, fig.align="center", results='hide', include=FALSE}
+#set up samplelist for the filtered matrices
+samplelist <- c(control)
+#Set up a parallel samplelist for raw matrices
+rawlists <- c(control.raw)
+
+# cursory clustering
+control <- SCTransform(control, vars.to.regress=c('percent.mito','percent.ribo'), verbose=FALSE, method='glmGamPoi')
+control <- RunPCA(control)
+control <- RunUMAP(control, dims=1:30)
+control <- FindNeighbors(control,reduction='pca', dims=1:30)
+control <- FindClusters(control, resolution=0.5)
+
+#Correcting the raw RNA counts
+DefaultAssay(control) <- 'RNA'
+#define our soup channel
+soup.channel <- SoupChannel(control.raw@assays$RNA@data, control@assays$RNA@data)
+#Set it to the clusters
+soup.channel <- setClusters(soup.channel, setNames(control@meta.data$seurat_clusters, rownames(control@meta.data)))
+soup.channel <- setDR(soup.channel, control@reductions$umap@cell.embeddings)
+#Estimate contaminant levels
+soup.channel <- autoEstCont(soup.channel)
+#Adjust the matrix
+adj.matrix <- adjustCounts(soup.channel, roundToInt=T)
+  
+#Since were in a loop- we will just define the sample as S for now and assign it later for ease
+s <- CreateSeuratObject(adj.matrix)
+s@meta.data$samp <- paste(unique(control$samp))
+  
+#But now since we have a raw object again we need to reprocess
+s[['percent.mito']] <- PercentageFeatureSet(s, pattern='^Mt-');
+s[['percent.ribo']] <- PercentageFeatureSet(s,pattern='^Rp[sl][[:digit:]]');
+s[['percent.hb']] <- PercentageFeatureSet(s, pattern = "^hbb|hba")
+s <- subset (s, subset= nFeature_RNA < 7000 & percent.mito < 10 & percent.ribo < 45 & nCount_RNA > 1000 & nFeature_RNA > 100 & percent.hb < 20);
+
+#Rewrite the control object as the corrected object
+control <- s 
+```
+
+### Normalization and regression
+
+Now we get into normalizing the samples, regressing non-viable data, and preparing the samples for integration (if applicable). Earlier workflows of scRNA data used a simple log-transformation as a normalization procedure. This has been shown to be insufficient as it primarily only corrects for depth. Current best practices include using regularized negative binomial regression- within Seurat being applied by SCTransform. This step also can be used to regress out things like mitochondrial content and ribosomal content as major drivers of differentiation- though as we saw above it can still be a major facet of clusters. 
+
+```{r Normalization, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 12, fig.width = 10}
+control <- SCTransform(control, vars.to.regress=c('percent.mito','percent.ribo'), verbose=FALSE, method='glmGamPoi')
+control <- RunPCA(control)
+control <- RunUMAP(control, dims=1:30)
+control <- FindNeighbors(control, reduction='pca', dims=1:30)
+resolutions <- c(0.2, 0.3, 0.4, 0.5, 0.6, 0.7,0.8, 0.9,1)
+control <- FindClusters(control, resolution=c(resolutions))
+
+plot_grid(DimPlot(control, group.by='SCT_snn_res.0.2', label=T) + NoLegend(),
+          DimPlot(control, group.by='SCT_snn_res.0.3', label=T) + NoLegend(),
+          DimPlot(control, group.by='SCT_snn_res.0.4', label=T) + NoLegend(),
+          DimPlot(control, group.by='SCT_snn_res.0.5', label=T) + NoLegend(),
+          DimPlot(control, group.by='SCT_snn_res.0.6', label=T) + NoLegend(),
+          DimPlot(control, group.by='SCT_snn_res.0.7', label=T) + NoLegend(),
+          DimPlot(control, group.by='SCT_snn_res.0.8', label=T) + NoLegend(),
+          DimPlot(control, group.by='SCT_snn_res.0.9', label=T) + NoLegend(),
+          DimPlot(control, group.by='SCT_snn_res.1', label=T) + NoLegend(),
+          ncol=3
+          )
+```
+
+Now by looking at these we can see a fair bit of segregation within the clusters. Overall, I would choose the 0.2 resolution as the one most likely to give nice biological separation, and we can plot it out.
+
+```{r SampDim, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 12, fig.width = 10}
+#Define the default resolution and plot it out
+DefaultAssay(control) <- 'SCT'
+Idents(control) <- 'SCT_snn_res.0.2'
+control[['seurat_clusters']] <- Idents(control)
+
+DimPlot(control, group.by='seurat_clusters', label=T, pt.size=1.5, ncol=2) + NoLegend()
+```
+
+### Annotation
+
+Now lets try to annotate these clusters. This can be done based on alignment to public databases (HCA, celldex, etc), label transfers from previous projects, or manual curation. Usually this requires a high level of domain-specific expertise and requires biological collaboration. Since these are immune cells, we will use a quick automated test and some canonical markers. 
+
+#### Manual curation
+
+##### Cluster markers
+
+The first step is usually identifying the top markers for each cluster. This will give you the expression compared to all other cells, as well as the percentage of cells in the respective cluster/all other cells that express the gene. From there you can start to try and assign annotations to each. 
+
+```{r ClusterMarkers, warning=FALSE, message=FALSE,  results='hide',fig.align="center"}
+Idents(control) <- 'seurat_clusters'
+control <- PrepSCTFindMarkers(control)
+markers <- FindAllMarkers(control, only.pos=T, min.diff.pct = 0.4)
+datatable(markers)
+```
+
+##### Plotting canonical markers
+
+Likewise, we can simply plot out markers we envision as canonical markers to interrogate the data further for annotations.
+
+```{r StackPlot, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+genes <- c('Aqp4','Gfap','Fgfr3','Slc14a1','Id3','Gja1','Gpr37l1','Camk2a','Cabra5','Islr2','Filip1','Rgs5','Ostn','Unc5b','Vamp1','Cacna1g','Smarca2','Fam198b','Smyd2','Cd63','Cntnap5','Phldb2','Arc','Tnk2','Sncb','Bcl2l1','Inpp5j','Igfbp2','Socs2','Htr2c','Scgn','Usp36','Abca8','Vip','Rps15a','Cdh3','Prkcg','Nos1','Penk','Gpm6a','Mapk6','Fuom','Pkia','Cplx2','Trdn','Slc17a6','Grm2','Pnoc','Slc6a3','Th','Slc18a2','Drd2','Slc32a1','Gad1','Gad2','Htr2c','Oprm1','Mog','Mog1','Pdgfra','C1qb','Msmo1','Syt10','Klhl4','Pcdh17','Ramp1','Ttn','Dbi','Reln','Lhx6','Trpc3','Chrd','Slc24a2','Sec11c','Mkx','Htr2c','Nxph4','Syt6','Cck','Npy','Krt17','Cbln4','Gpr83','Wfdc2')
+
+p <- VlnPlot(control, features=c(genes), stack=TRUE, sort=TRUE, flip=TRUE,group.by='seurat_clusters') + theme(legend.position='none')
+p
+```
+
+##### Assigning Annotations
+Based on the combination of manual curation and dissection of marker genes (see paper for more details and the biology of it, as well as citations to various markers used), we assigned the specific annotations to the clusters as below. 
+
+```{r Annotations, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+
+Idents(control) <- 'seurat_clusters'
+control <- StashIdent(control, save.name='seurat_original_clusters')
+
+control <- RenameIdents(control, "0"="Excitatory Neurons 1")
+control <- RenameIdents(control, "1"="Excitatory Neurons 2")
+control <- RenameIdents(control, "2"="Excitatory Neurons 3")
+control <- RenameIdents(control, "3"="Excitatory Neurons 4")
+control <- RenameIdents(control, "4"="Excitatory Neurons 5")
+control <- RenameIdents(control, "5"="Oligodendrocytes")
+control <- RenameIdents(control, "6"="PV Inhibitory Neurons")
+control <- RenameIdents(control, "7"="SST Inhibitory Neurons")
+control <- RenameIdents(control, "8"="Unclassified Neurons 1")
+control <- RenameIdents(control, "9"="VIP Inhibitory Neurons")
+control <- RenameIdents(control, "10"="Astrocytes")
+control <- RenameIdents(control, "11"="Unclassified Neurons 2")
+control <- RenameIdents(control, "12"="OPCs")
+control <- RenameIdents(control, "13"="Excitatory Neurons 7")
+control <- RenameIdents(control, "14"="Excitatory Neurons 6")
+control <- RenameIdents(control, "15"="Microglia")
+
+control[['Annotations']] <- Idents(object=control)
+
+DimPlot(control, group.by='Annotations', label=T, pt.size=1.75, label.size=5, cols=c("Excitatory Neurons 1"="#f8b6ff", "Excitatory Neurons 2"="#f090fa", "Excitatory Neurons 3"="#fda4ff","Excitatory Neurons 4"="#d0a4ff","Excitatory Neurons 5"="#ff69b4","PV Inhibitory Neurons"="#72b2f4","SST Inhibitory Neurons"="#348feb","Unclassified Neurons 1"="#ffe599","Unclassified Neurons 2"="#ffd966","VIP Inhibitory Neurons"="#82b6e5","Astrocytes"="#0ad1c6","OPCs"="#73c152","Microglia"="#f5c19d","Excitatory Neurons 6"="#efd68b","Excitatory Neurons 7"="#b1c37c","Oligodendrocytes"="#59c52a"), repel=T)
+```
+
+##### Plotting more canonical markers
+```{r VlnCanon, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+genes <- c('Chrm3','Cux2','Unc5d','Dgkb','Rorb','Thsd7a','Camk4','Sema3e','Adamts3','Il1rapl2','Plcxd3','Thsd7a','Garnl3','Foxp2','Zfpm2','Gad1','Gad2','Slc6a1','Eya4','Reln','Grin3a','Cdh9','Sema3c','Grm8','Slit2','Tox','Vip','Gabrg3','Cnr1','Lypd6','Rgs12','B3gat2','Mgat4c','Mbp','Mobp','Mag','Mal','Mog','Tubb4a','Ptprz1','Pdgfra','Sox6','Arhgap31','Gpr17','Vcan','Slc1a2','Slc1a3','Fam107a','S100b','Ndrg2','Apoe','Cx3cr1','Ctss','Slco2b1','Zfhx3','Inpp5d','Fibcd1','Gpr161','Fibcd1','Cpne7','Scn3b','Nxph1','Olfm3','Neto2','Trpc3')
+p <- VlnPlot(control, features=c(genes), stack=TRUE, sort=FALSE, flip=TRUE,group.by='Annotations',cols=c("Excitatory Neurons 1"="#f8b6ff", "Excitatory Neurons 2"="#f090fa", "Excitatory Neurons 3"="#fda4ff","Excitatory Neurons 4"="#d0a4ff","Excitatory Neurons 5"="#ff69b4","PV Inhibitory Neurons"="#72b2f4","SST Inhibitory Neurons"="#348feb","Unclassified Neurons 1"="#ffe599","Unclassified Neurons 2"="#ffd966","VIP Inhibitory Neurons"="#82b6e5","Astrocytes"="#0ad1c6","OPCs"="#73c152","Microglia"="#f5c19d","Excitatory Neurons 6"="#efd68b","Excitatory Neurons 7"="#b1c37c","Oligodendrocytes"="#59c52a"), fill.by='ident') + theme(legend.position='none')
+p
+```
+
+### Reclustering Astrocytes
+A point of particular interest in this study was astrocytes, so to dive further into those we reclustered just the astrocyte cluster to attempt to elucidate the diversity within. 
+
+```{r AstroRecluster, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+Idents(control) <- 'seurat_clusters'
+astros <- subset(control, idents=c(10))
+DefaultAssay(astros) <- 'RNA'
+
+astros <- DietSeurat(astros, assays='RNA')
+astros <- SCTransform(astros, vars.to.regress = c('percent.mito','percent.ribo'),verbose=FALSE)
+astros <- RunPCA(astros)
+astros <- RunUMAP(astros, dims=1:30)
+astros <- FindNeighbors(astros, reduction='pca', dims=1:30)
+resolutions <- c(0.2, 0.3, 0.4, 0.5, 0.6, 0.7,0.8, 0.9,1)
+astros <- FindClusters(astros, resolution=c(resolutions))
+
+
+plot_grid(DimPlot(astros, group.by='SCT_snn_res.0.2', label=T) + NoLegend(),
+          DimPlot(astros, group.by='SCT_snn_res.0.3', label=T) + NoLegend(),
+          DimPlot(astros, group.by='SCT_snn_res.0.4', label=T) + NoLegend(),
+          DimPlot(astros, group.by='SCT_snn_res.0.5', label=T) + NoLegend(),
+          DimPlot(astros, group.by='SCT_snn_res.0.6', label=T) + NoLegend(),
+          DimPlot(astros, group.by='SCT_snn_res.0.7', label=T) + NoLegend(),
+          DimPlot(astros, group.by='SCT_snn_res.0.8', label=T) + NoLegend(),
+          DimPlot(astros, group.by='SCT_snn_res.0.9', label=T) + NoLegend(),
+          DimPlot(astros, group.by='SCT_snn_res.1', label=T) + NoLegend(),
+          ncol=3
+          )
+```
+
+```{r AstroClusters, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+DefaultAssay(astros) <- 'SCT'
+Idents(astros) <- 'SCT_snn_res.0.5'
+astros[['seurat_clusters']] <- Idents(astros)
+
+DimPlot(astros, group.by='seurat_clusters', label=T, pt.size=1.5, ncol=2) + NoLegend()
+
+```
+
+```{r AstroMarkers, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+Idents(astros) <- 'seurat_clusters'
+astros <- PrepSCTFindMarkers(astros)
+astromarkers <- FindAllMarkers(astros, only.pos=T, min.diff.pct = 0.4)
+
+datatable(astromarkers)
+```
+
+#### Astrocyte Pathways
+Once we had identified the marker genes per astrocyte cluster, we wanted to view how the different populations were different from each other to try and delineate function. For this we used over-representation analysis against KEGG and GO databases. 
+
+```{r AstroPathways, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+library(clusterProfiler)
+library(msigdbr)
+library(stringr)
+library(enrichplot)
+
+BiocManager::install("org.Rn.eg.db")
+organism='org.Rn.eg.db'
+korg='rno'
+
+#####################################
+dir.create('./ORA_astros')
+dir.create('./ORA_astros/KEGG')
+dir.create('./ORA_astros/GO')
+dir.create('./ORA_astros/GO/BP')
+dir.create('./ORA_astros/GO/CC')
+dir.create('./ORA_astros/GO/MF')
+
+
+for (i in unique(Idents(astros))){
+  marks <- FindMarkers(astros, ident.1=i, only.pos=T, min.diff.pct = 0.3, logfc.threshold = 0.5)
+  marks <- subset(marks, p_val_adj < 0.05)
+  genes <- rownames(marks)
+  
+  ids <- bitr(genes, fromType='SYMBOL', toType='ENTREZID', OrgDb=organism)
+  
+  run <- try({
+    ora <- enrichGO(gene=ids$ENTREZID, ont='BP', keyType='ENTREZID',OrgDb=organism)
+    
+    plot <- dotplot(ora, showCategory=10, font.size=10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+    jpeg(paste('./ORA_astros/GO/BP/cluster_',i,'_GO_BP_ORA.jpg',sep=''), height=800, width=800)
+    print(plot)
+    dev.off()
+    
+    write.csv(ora, file=paste('./ORA_astros/GO/BP/cluster_',i,'_GO_BP_ORA.csv',sep=''))
+  })
+  if(inherits(run, 'try-error')) {
+    next
+  }
+  run <- try({
+    ora <- enrichGO(gene=ids$ENTREZID, ont='CC', keyType='ENTREZID',OrgDb=organism)
+    
+    plot <- dotplot(ora, showCategory=10, font.size=10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+    jpeg(paste('./ORA_astros/GO/CC/cluster_',i,'_GO_CC_ORA.jpg',sep=''), height=800, width=800)
+    print(plot)
+    dev.off()
+    
+    write.csv(ora, file=paste('./ORA_astros/GO/CC/cluster_',i,'_GO_CC_ORA.csv',sep=''))
+  })
+  if(inherits(run, 'try-error')) {
+    next
+  }
+  
+  run <- try({
+    ora <- enrichGO(gene=ids$ENTREZID, ont='BP', keyType='ENTREZID',OrgDb=organism)
+    
+    plot <- dotplot(ora, showCategory=10, font.size=10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+    jpeg(paste('./ORA_astros/GO/MF/cluster_',i,'_GO_MF_ORA.jpg',sep=''), height=800, width=800)
+    print(plot)
+    dev.off()
+    
+    write.csv(ora, file=paste('./ORA_astros/GO/MF/cluster_',i,'_GO_MF_ORA.csv',sep=''))
+  })
+  if(inherits(run, 'try-error')) {
+    next
+  }
+  
+  run <- try({
+    ora <- enrichKEGG(gene=ids$ENTREZID, organism=korg)
+    
+    plot <- dotplot(ora, showCategory=10, font.size=10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+    jpeg(paste('./ORA_astros/KEGG/cluster_',i,'_KEGG_ORA.jpg',sep=''), height=800, width=800)
+    print(plot)
+    dev.off()
+    
+    write.csv(ora, file=paste('./ORA_astros/KEGG/cluster_',i,'_KEGG_ORA.csv',sep=''))
+  })
+  if(inherits(run, 'try-error')) {
+    next
+  }
+  
+}
+```
+
+### Reclustering Inhibitory neurons
+Likewise we dug into the inhibitory neuron subsets. 
+
+```{r InhibRecluster, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+
+Idents(control) <- 'Annotations'
+inhib <- subset(control, idents=c('PV Inhibitory Neurons','VIP Inhibitory Neurons','SST Inhibitory Neurons'))
+DefaultAssay(inhib) <- 'RNA'
+
+inhib <- DietSeurat(inhib, assays='RNA')
+inhib <- SCTransform(inhib, vars.to.regress = c('percent.mito','percent.ribo'),verbose=FALSE)
+inhib <- RunPCA(inhib)
+inhib <- RunUMAP(inhib, dims=1:30)
+inhib <- FindNeighbors(inhib, reduction='pca', dims=1:30)
+resolutions <- c(0.2, 0.3, 0.4, 0.5, 0.6, 0.7,0.8, 0.9,1)
+inhib <- FindClusters(inhib, resolution=c(resolutions))
+
+
+plot_grid(DimPlot(inhib, group.by='SCT_snn_res.0.2', label=T) + NoLegend(),
+          DimPlot(inhib, group.by='SCT_snn_res.0.3', label=T) + NoLegend(),
+          DimPlot(inhib, group.by='SCT_snn_res.0.4', label=T) + NoLegend(),
+          DimPlot(inhib, group.by='SCT_snn_res.0.5', label=T) + NoLegend(),
+          DimPlot(inhib, group.by='SCT_snn_res.0.6', label=T) + NoLegend(),
+          DimPlot(inhib, group.by='SCT_snn_res.0.7', label=T) + NoLegend(),
+          DimPlot(inhib, group.by='SCT_snn_res.0.8', label=T) + NoLegend(),
+          DimPlot(inhib, group.by='SCT_snn_res.0.9', label=T) + NoLegend(),
+          DimPlot(inhib, group.by='SCT_snn_res.1', label=T) + NoLegend(),
+          ncol=3
+          )
+```
+
+```{r InhibClusters, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+DefaultAssay(inhib) <- 'SCT'
+Idents(inhib) <- 'SCT_snn_res.0.2'
+inhib[['seurat_clusters']] <- Idents(inhib)
+
+DimPlot(inhib, pt.size=2, label=T,cols=c("Excitatory Neurons 1"="#f8b6ff", "Excitatory Neurons 2"="#f090fa", "Excitatory Neurons 3"="#fda4ff","Excitatory Neurons 4"="#d0a4ff","Excitatory Neurons 5"="#ff69b4","PV Inhibitory Neurons"="#72b2f4","SST Inhibitory Neurons"="#348feb","Unclassified Neurons 1"="#ffe599","Unclassified Neurons 2"="#ffd966","VIP Inhibitory Neurons"="#82b6e5","Astrocytes"="#0ad1c6","OPCs"="#73c152","Microglia"="#f5c19d","Excitatory Neurons 6"="#efd68b","Excitatory Neurons 7"="#b1c37c","Oligodendrocytes"="#59c52a"), group.by='Annotations')
+```
+
+```{r InhibMarkers, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+Idents(inhib) <- 'seurat_clusters'
+inhib <- PrepSCTFindMarkers(inhib)
+inhibmarkers <- FindAllMarkers(inhib, only.pos=T, min.diff.pct = 0.4)
+
+datatable(inhibmarkers)
+```
+
+#### Inhibitory pathways analysis
+
+```{r InhibPathways, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+#####################################
+dir.create('./ORA_inhib')
+dir.create('./ORA_inhib/KEGG')
+dir.create('./ORA_inhib/GO')
+dir.create('./ORA_inhib/GO/BP')
+dir.create('./ORA_inhib/GO/CC')
+dir.create('./ORA_inhib/GO/MF')
+
+
+for (i in unique(Idents(inhib))){
+  marks <- FindMarkers(inhib, ident.1=i, only.pos=T, min.diff.pct = 0.3, logfc.threshold = 0.5)
+  marks <- subset(marks, p_val_adj < 0.05)
+  genes <- rownames(marks)
+  
+  ids <- bitr(genes, fromType='SYMBOL', toType='ENTREZID', OrgDb=organism)
+  
+  run <- try({
+    ora <- enrichGO(gene=ids$ENTREZID, ont='BP', keyType='ENTREZID',OrgDb=organism)
+    
+    plot <- dotplot(ora, showCategory=10, font.size=10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+    jpeg(paste('./ORA_inhib/GO/BP/cluster_',i,'_GO_BP_ORA.jpg',sep=''), height=800, width=800)
+    print(plot)
+    dev.off()
+    
+    write.csv(ora, file=paste('./ORA_inhib/GO/BP/cluster_',i,'_GO_BP_ORA.csv',sep=''))
+  })
+  if(inherits(run, 'try-error')) {
+    next
+  }
+  run <- try({
+    ora <- enrichGO(gene=ids$ENTREZID, ont='CC', keyType='ENTREZID',OrgDb=organism)
+    
+    plot <- dotplot(ora, showCategory=10, font.size=10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+    jpeg(paste('./ORA_inhib/GO/CC/cluster_',i,'_GO_CC_ORA.jpg',sep=''), height=800, width=800)
+    print(plot)
+    dev.off()
+    
+    write.csv(ora, file=paste('./ORA_inhib/GO/CC/cluster_',i,'_GO_CC_ORA.csv',sep=''))
+  })
+  if(inherits(run, 'try-error')) {
+    next
+  }
+  
+  run <- try({
+    ora <- enrichGO(gene=ids$ENTREZID, ont='BP', keyType='ENTREZID',OrgDb=organism)
+    
+    plot <- dotplot(ora, showCategory=10, font.size=10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+    jpeg(paste('./ORA_inhib/GO/MF/cluster_',i,'_GO_MF_ORA.jpg',sep=''), height=800, width=800)
+    print(plot)
+    dev.off()
+    
+    write.csv(ora, file=paste('./ORA_inhib/GO/MF/cluster_',i,'_GO_MF_ORA.csv',sep=''))
+  })
+  if(inherits(run, 'try-error')) {
+    next
+  }
+  
+  run <- try({
+    ora <- enrichKEGG(gene=ids$ENTREZID, organism=korg)
+    
+    plot <- dotplot(ora, showCategory=10, font.size=10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+    jpeg(paste('./ORA_inhib/KEGG/cluster_',i,'_KEGG_ORA.jpg',sep=''), height=800, width=800)
+    print(plot)
+    dev.off()
+    
+    write.csv(ora, file=paste('./ORA_inhib/KEGG/cluster_',i,'_KEGG_ORA.csv',sep=''))
+  })
+  if(inherits(run, 'try-error')) {
+    next
+  }
+  
+}
+```
+
+### Reclustering Excitatory neurons
+And once again for excitatory neurons!
+
+```{r ExciteRecluster, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+Idents(control) <- 'Annotations'
+excit <- subset(control, idents=c('Excitatory Neurons 1','Excitatory Neurons 2','Excitatory Neurons 3','Excitatory Neurons 4','Excitatory Neurons 5'))
+DefaultAssay(excit) <- 'RNA'
+
+excit <- DietSeurat(excit, assays='RNA')
+excit <- SCTransform(excit, vars.to.regress = c('percent.mito','percent.ribo'),verbose=FALSE)
+excit <- RunPCA(excit)
+excit <- RunUMAP(excit, dims=1:30)
+excit <- FindNeighbors(excit, reduction='pca', dims=1:30)
+resolutions <- c(0.2, 0.3, 0.4, 0.5, 0.6, 0.7,0.8, 0.9,1)
+excit <- FindClusters(excit, resolution=c(resolutions))
+
+plot_grid(DimPlot(excit, group.by='SCT_snn_res.0.2', label=T) + NoLegend(),
+          DimPlot(excit, group.by='SCT_snn_res.0.3', label=T) + NoLegend(),
+          DimPlot(excit, group.by='SCT_snn_res.0.4', label=T) + NoLegend(),
+          DimPlot(excit, group.by='SCT_snn_res.0.5', label=T) + NoLegend(),
+          DimPlot(excit, group.by='SCT_snn_res.0.6', label=T) + NoLegend(),
+          DimPlot(excit, group.by='SCT_snn_res.0.7', label=T) + NoLegend(),
+          DimPlot(excit, group.by='SCT_snn_res.0.8', label=T) + NoLegend(),
+          DimPlot(excit, group.by='SCT_snn_res.0.9', label=T) + NoLegend(),
+          DimPlot(excit, group.by='SCT_snn_res.1', label=T) + NoLegend(),
+          ncol=3
+          )
+```
+
+```{r ExciteCluster, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+DefaultAssay(excit) <- 'SCT'
+Idents(excit) <- 'SCT_snn_res.0.2'
+excit[['seurat_clusters']] <- Idents(excit)
+
+DimPlot(excit, pt.size=2, label=T,cols=c("Excitatory Neurons 1"="#f8b6ff", "Excitatory Neurons 2"="#f090fa", "Excitatory Neurons 3"="#fda4ff","Excitatory Neurons 4"="#d0a4ff","Excitatory Neurons 5"="#ff69b4","PV Inhibitory Neurons"="#72b2f4","SST Inhibitory Neurons"="#348feb","Unclassified Neurons 1"="#ffe599","Unclassified Neurons 2"="#ffd966","VIP Inhibitory Neurons"="#82b6e5","Astrocytes"="#0ad1c6","OPCs"="#73c152","Microglia"="#f5c19d","Excitatory Neurons 6"="#efd68b","Excitatory Neurons 7"="#b1c37c","Oligodendrocytes"="#59c52a"), group.by='Annotations')
+```
+
+```{r ExciteMarkers, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+Idents(excit) <- 'seurat_clusters'
+excit <- PrepSCTFindMarkers(excit)
+excitmarkers <- FindAllMarkers(excit, only.pos=T, min.diff.pct = 0.4)
+datatable(excitmarkers)
+```
+
+#### Excitatory pathway analysis
+```{r ExcitePathways, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+#####################################
+dir.create('./ORA_excit')
+dir.create('./ORA_excit/KEGG')
+dir.create('./ORA_excit/GO')
+dir.create('./ORA_excit/GO/BP')
+dir.create('./ORA_excit/GO/CC')
+dir.create('./ORA_excit/GO/MF')
+
+
+for (i in unique(Idents(excit))){
+  marks <- FindMarkers(excit, ident.1=i, only.pos=T, min.diff.pct = 0.3, logfc.threshold = 0.5)
+  marks <- subset(marks, p_val_adj < 0.05)
+  genes <- rownames(marks)
+  
+  ids <- bitr(genes, fromType='SYMBOL', toType='ENTREZID', OrgDb=organism)
+  
+  run <- try({
+    ora <- enrichGO(gene=ids$ENTREZID, ont='BP', keyType='ENTREZID',OrgDb=organism)
+    
+    plot <- dotplot(ora, showCategory=10, font.size=10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+    jpeg(paste('./ORA_excit/GO/BP/cluster_',i,'_GO_BP_ORA.jpg',sep=''), height=800, width=800)
+    print(plot)
+    dev.off()
+    
+    write.csv(ora, file=paste('./ORA_excit/GO/BP/cluster_',i,'_GO_BP_ORA.csv',sep=''))
+  })
+  if(inherits(run, 'try-error')) {
+    next
+  }
+  run <- try({
+    ora <- enrichGO(gene=ids$ENTREZID, ont='CC', keyType='ENTREZID',OrgDb=organism)
+    
+    plot <- dotplot(ora, showCategory=10, font.size=10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+    jpeg(paste('./ORA_excit/GO/CC/cluster_',i,'_GO_CC_ORA.jpg',sep=''), height=800, width=800)
+    print(plot)
+    dev.off()
+    
+    write.csv(ora, file=paste('./ORA_excit/GO/CC/cluster_',i,'_GO_CC_ORA.csv',sep=''))
+  })
+  if(inherits(run, 'try-error')) {
+    next
+  }
+  
+  run <- try({
+    ora <- enrichGO(gene=ids$ENTREZID, ont='BP', keyType='ENTREZID',OrgDb=organism)
+    
+    plot <- dotplot(ora, showCategory=10, font.size=10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+    jpeg(paste('./ORA_excit/GO/MF/cluster_',i,'_GO_MF_ORA.jpg',sep=''), height=800, width=800)
+    print(plot)
+    dev.off()
+    
+    write.csv(ora, file=paste('./ORA_excit/GO/MF/cluster_',i,'_GO_MF_ORA.csv',sep=''))
+  })
+  if(inherits(run, 'try-error')) {
+    next
+  }
+  
+  run <- try({
+    ora <- enrichKEGG(gene=ids$ENTREZID, organism=korg)
+    
+    plot <- dotplot(ora, showCategory=10, font.size=10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+    jpeg(paste('./ORA_excit/KEGG/cluster_',i,'_KEGG_ORA.jpg',sep=''), height=800, width=800)
+    print(plot)
+    dev.off()
+    
+    write.csv(ora, file=paste('./ORA_excit/KEGG/cluster_',i,'_KEGG_ORA.csv',sep=''))
+  })
+  if(inherits(run, 'try-error')) {
+    next
+  }
+  
+}
+
+```
+
+##### Publication plots
+```{r PubPlots, warning=FALSE, message=FALSE, fig.align="center", results='hide', fig.height = 16, fig.width = 10}
+###########################################################
+# Figure 1
+## 1A: UMAP plot
+## 1B: Composition plot
+
+temp <- control
+temp <- subset(temp, idents=c('Excitatory Neurons 1', 'Excitatory Neurons 2','Excitatory Neurons 3','Excitatory Neurons 4','Excitatory Neurons 5','Excitatory Neurons 6','SST Inhibitory Neurons','PV Inhibitory Neurons','VIP Inhibitory Neurons','Microglia','OPCs','Astrocytes','Oligodendrocytes','Unclassified Neurons 1','Unclassified Neurons 2'))
+
+temp@meta.data$Annotations <-stringr::str_wrap(temp@meta.data$Annotations, 15)
+p1a <- DimPlot(temp, group.by='Annotations', label=T, pt.size=1.75, label.size=4, cols=c("Excitatory\nNeurons 1"="#f8b6ff", "Excitatory\nNeurons 2"="#f090fa", "Excitatory\nNeurons 3"="#fda4ff","Excitatory\nNeurons 4"="#d0a4ff","Excitatory\nNeurons 5"="#ff69b4","PV Inhibitory\nNeurons"="#72b2f4","SST Inhibitory\nNeurons"="#348feb","Unclassified\nNeurons 1"="#ffe599","Unclassified\nNeurons 2"="#ffd966","VIP Inhibitory\nNeurons"="#1c51e6","Astrocytes"="#0ad1c6","OPCs"="#73c152","Microglia"="#f5c19d","Excitatory\nNeurons 6"="#efd68b","Excitatory\nNeurons 7"="#b1c37c","Oligodendrocytes"="#59c52a"), repel=T) + NoLegend() + ggtitle(NULL)
+
+counts <- table(Idents(temp), temp$samp)
+counts <- prop.table(counts, margin=2)*100
+#Organize the dataframe for easy plotting
+df <- as.data.frame.matrix(counts) 
+df$cluster <- rownames(df)
+df <- df %>% gather(., treatment, props, Control:Control, factor_key=T) 
+group.colors <- c("Excitatory Neurons 1"="#f8b6ff", "Excitatory Neurons 2"="#f090fa", "Excitatory Neurons 3"="#fda4ff","Excitatory Neurons 4"="#d0a4ff","Excitatory Neurons 5"="#ff69b4","PV Inhibitory Neurons"="#72b2f4","SST Inhibitory Neurons"="#348feb","Unclassified Neurons 1"="#ffe599","Unclassified Neurons 2"="#ffd966","VIP Inhibitory Neurons"="#1c51e6","Astrocytes"="#0ad1c6","OPCs"="#73c152","Microglia"="#f5c19d","Excitatory Neurons 6"="#efd68b","Excitatory Neurons 7"="#b1c37c","Oligodendrocytes"="#59c52a")
+
+p1b <- ggplot(df, aes(x=treatment, y=props, fill=cluster)) + geom_bar(stat='identity', color='black') + theme_minimal() + labs(title='',x='',y='Percentage of cells', fill='Cluster:') + theme(text=element_text(size=20), axis.text.x = element_text(angle = 315, size=0)) + scale_fill_manual(values=group.colors) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+title <- ggdraw() + 
+  draw_label(
+    "Figure 1",
+    fontface = 'bold',
+    x = 0,
+    hjust = 0,
+    size=20
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+
+plots <- cowplot::plot_grid(p1a, p1b, ncol=2, rel_widths=c(0.6,0.4), labels=c('A','B'))
+f1 <- cowplot::plot_grid(title, plots, ncol=1, rel_heights=c(0.1,1))
+
+###########################################################
+# Figure 2
+## 2A: UMAP plot for Inhibs
+## 2B: UMAP plot for Excit
+## 2C: Vln for Inhib markers
+## 2D: Vln for Excit markers
+## 2E: Composition for Inhibs
+## 2F: Composition for Excit
+
+tempinhib <- inhib
+tempinhib@meta.data$Annotations <-stringr::str_wrap(tempinhib@meta.data$Annotations, 15)
+p2a <- DimPlot(tempinhib, pt.size=2, label=T,repel=T,label.size=4,cols=c("Excitatory\nNeurons 1"="#f8b6ff", "Excitatory\nNeurons 2"="#f090fa", "Excitatory\nNeurons 3"="#fda4ff","Excitatory\nNeurons 4"="#d0a4ff","Excitatory\nNeurons 5"="#ff69b4","PV Inhibitory\nNeurons"="#72b2f4","SST Inhibitory\nNeurons"="#348feb","Unclassified\nNeurons 1"="#ffe599","Unclassified\nNeurons 2"="#ffd966","VIP Inhibitory\nNeurons"="#1c51e6","Astrocytes"="#0ad1c6","OPCs"="#73c152","Microglia"="#f5c19d","Excitatory Neurons 6"="#efd68b","Excitatory Neurons 7"="#b1c37c","Oligodendrocytes"="#59c52a"), group.by='Annotations') + NoLegend()+ ggtitle(NULL)
+
+inhib_genes <- c('Sox5','Grin3a','Vip','Erbb4','Adarb2','Gad1')
+p2c <- VlnPlot(inhib, features=c(inhib_genes), stack=TRUE, sort=FALSE, flip=TRUE,group.by='Annotations',cols=c("Excitatory Neurons 1"="#f8b6ff", "Excitatory Neurons 2"="#f090fa", "Excitatory Neurons 3"="#fda4ff","Excitatory Neurons 4"="#d0a4ff","Excitatory Neurons 5"="#ff69b4","PV Inhibitory Neurons"="#72b2f4","SST Inhibitory Neurons"="#348feb","Unclassified Neurons 1"="#ffe599","Unclassified Neurons 2"="#ffd966","VIP Inhibitory Neurons"="#1c51e6","Astrocytes"="#0ad1c6","OPCs"="#73c152","Microglia"="#f5c19d","Excitatory Neurons 6"="#efd68b","Excitatory Neurons 7"="#b1c37c","Oligodendrocytes"="#59c52a"), fill.by='ident') + theme(legend.position='none')+ labs(title='',x='') + theme(text=element_text(size=15),axis.text.x =element_text(size=9),axis.title.x = element_blank())+scale_x_discrete(labels=function(x) str_wrap(x, width = 15))
+
+tempexcit <- excit
+tempexcit@meta.data$Annotations <-stringr::str_wrap(tempexcit@meta.data$Annotations, 15)
+p2b <- DimPlot(tempexcit, pt.size=2, label=T,repel=T,label.size=4,cols=c("Excitatory\nNeurons 1"="#f8b6ff", "Excitatory\nNeurons 2"="#f090fa", "Excitatory\nNeurons 3"="#fda4ff","Excitatory\nNeurons 4"="#d0a4ff","Excitatory\nNeurons 5"="#ff69b4","PV Inhibitory\nNeurons"="#72b2f4","SST Inhibitory\nNeurons"="#348feb","Unclassified\nNeurons 1"="#ffe599","Unclassified\nNeurons 2"="#ffd966","VIP Inhibitory\nNeurons"="#1c51e6","Astrocytes"="#0ad1c6","OPCs"="#73c152","Microglia"="#f5c19d","Excitatory Neurons 6"="#efd68b","Excitatory Neurons 7"="#b1c37c","Oligodendrocytes"="#59c52a"), group.by='Annotations') + NoLegend()+ ggtitle(NULL)
+
+excit_genes <- c('Rorb','Foxp2','Cux1','Garnl3','Chrm3','Grm8')
+ordered_level <- c('Excitatory Neurons 1','Excitatory Neurons 2','Excitatory Neurons 3','Excitatory Neurons 4','Excitatory Neurons 5')
+excit@meta.data$Annotations <- factor(x=excit@meta.data$Annotations,levels=ordered_level)
+p2d <- VlnPlot(excit, features=c(excit_genes), stack=TRUE, sort=FALSE, flip=TRUE,group.by='Annotations',cols=c("Excitatory Neurons 1"="#f8b6ff", "Excitatory Neurons 2"="#f090fa", "Excitatory Neurons 3"="#fda4ff","Excitatory Neurons 4"="#d0a4ff","Excitatory Neurons 5"="#ff69b4","PV Inhibitory\nNeurons"="#72b2f4","SST Inhibitory\nNeurons"="#348feb","Unclassified Neurons 1"="#ffe599","Unclassified Neurons 2"="#ffd966","VIP Inhibitory\nNeurons"="#1c51e6","Astrocytes"="#0ad1c6","OPCs"="#73c152","Microglia"="#f5c19d","Excitatory Neurons 6"="#efd68b","Excitatory Neurons 7"="#b1c37c","Oligodendrocytes"="#59c52a"), fill.by='ident') + theme(legend.position='none') + labs(title='',x='') + theme(text=element_text(size=15),axis.text.x =element_text(size=9),axis.title.x = element_blank())+scale_x_discrete(labels=function(x) str_wrap(x, width = 15))
+
+Idents(inhib) <- 'Annotations'
+counts <- table(Idents(inhib), inhib$samp)
+counts <- prop.table(counts, margin=2)*100
+#Organize the dataframe for easy plotting
+df <- as.data.frame.matrix(counts) 
+df$cluster <- rownames(df)
+df <- df %>% gather(., treatment, props, Control:Control, factor_key=T) 
+group.colors <- c("Excitatory\nNeurons 1"="#f8b6ff", "Excitatory\nNeurons 2"="#f090fa", "Excitatory\nNeurons 3"="#fda4ff","Excitatory\nNeurons 4"="#d0a4ff","Excitatory Neurons\n5"="#ff69b4","PV\nInhibitory\nNeurons"="#72b2f4","SST\nInhibitory\nNeurons"="#348feb","Unclassified Neurons 1"="#ffe599","Unclassified Neurons 2"="#ffd966","VIP\nInhibitory\nNeurons"="#1c51e6","Astrocytes"="#0ad1c6","OPCs"="#73c152","Microglia"="#f5c19d","Excitatory Neurons 6"="#efd68b","Excitatory Neurons 7"="#b1c37c","Oligodendrocytes"="#59c52a")
+df$cluster <- stringr::str_wrap(df$cluster, 8)
+p2e <- ggplot(df, aes(x=treatment, y=props, fill=cluster, label=cluster)) + geom_bar(stat='identity', color='black') + theme_minimal() + labs(title='',x='',y='Percentage of cells', fill='Cluster:') + theme(text=element_text(size=15), axis.text.x = element_text(angle = 315, size=0)) + scale_fill_manual(values=group.colors,labels = function(x) str_wrap(x, width = 15)) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))+ NoLegend()+
+  geom_text(size = 4, position = position_stack(vjust = 0.5))
+
+Idents(excit) <- 'Annotations'
+counts <- table(Idents(excit), excit$samp)
+counts <- prop.table(counts, margin=2)*100
+#Organize the dataframe for easy plotting
+df <- as.data.frame.matrix(counts) 
+df$cluster <- rownames(df)
+df <- df %>% gather(., treatment, props, Control:Control, factor_key=T) 
+group.colors <- c("Excitatory\nNeurons 1"="#f8b6ff", "Excitatory\nNeurons 2"="#f090fa", "Excitatory\nNeurons 3"="#fda4ff","Excitatory\nNeurons 4"="#d0a4ff","Excitatory\nNeurons 5"="#ff69b4","PV Inhibitory Neurons"="#72b2f4","SST Inhibitory Neurons"="#348feb","Unclassified Neurons 1"="#ffe599","Unclassified Neurons 2"="#ffd966","VIP Inhibitory Neurons"="#1c51e6","Astrocytes"="#0ad1c6","OPCs"="#73c152","Microglia"="#f5c19d","Excitatory Neurons 6"="#efd68b","Excitatory Neurons 7"="#b1c37c","Oligodendrocytes"="#59c52a")
+df$cluster <- stringr::str_wrap(df$cluster, 15)
+p2f <- ggplot(df, aes(x=treatment, y=props, fill=cluster, label=cluster)) + geom_bar(stat='identity', color='black') + theme_minimal() + labs(title='',x='',y='Percentage of cells', fill='Cluster:') + theme(text=element_text(size=15), axis.text.x = element_text(angle = 315, size=0)) + scale_fill_manual(values=group.colors,labels = function(x) str_wrap(x, width = 15)) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))+ NoLegend()+
+  geom_text(size = 4, position = position_stack(vjust = 0.5))
+
+
+title <- ggdraw() + 
+  draw_label(
+    "Figure 2",
+    fontface = 'bold',
+    x = 0,
+    hjust = 0,
+    size=20
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+
+topplots <- cowplot::plot_grid(p2a, p2b, ncol=2, rel_widths=c(0.5,0.5), labels=c('A','B'))
+
+leftplots <- cowplot::plot_grid(
+  cowplot::plot_grid(NULL,p2c,NULL,ncol=3, rel_widths = c(0.1, 0.8, 0.1)),
+  cowplot::plot_grid(NULL,p2e,NULL,ncol=3, rel_widths = c(0.1, 0.8, 0.1)),
+  ncol=2, labels=c('C'), 
+  rel_widths=c(0.6,0.4)
+)
+rightplots <- cowplot::plot_grid(
+  cowplot::plot_grid(NULL,p2d,NULL,ncol=3, rel_widths = c(0.1, 0.8, 0.1)),
+  cowplot::plot_grid(NULL,p2f,NULL,ncol=3, rel_widths = c(0.1, 0.8, 0.1)),
+  ncol=2, labels=c('D'), 
+  rel_widths=c(0.6,0.4)
+)
+
+botplots <- cowplot::plot_grid(
+  leftplots, rightplots, ncol=2
+)
+
+f2 <- cowplot::plot_grid(title, topplots, botplots, ncol=1, rel_heights=c(0.1,1,1))
+
+###########################################################
+# Figure 3
+## 3A: UMAP plot for Astros
+## 3B: Composition
+## 3C: Markers
+
+Idents(astros) <- 'seurat_clusters'
+astros <- StashIdent(astros, save.name='seurat_original_clusters')
+
+astros <- RenameIdents(astros, "0"="Astrocyte\nSubType 1")
+astros <- RenameIdents(astros, "1"="Astrocyte\nSubType 2")
+astros <- RenameIdents(astros, "2"="Astrocyte\nSubType 3")
+astros <- RenameIdents(astros, "3"="Astrocyte\nSubType 4")
+
+astros[['AstroAnnotations']] <- Idents(object=astros)
+
+p3a <- DimPlot(astros, pt.size=2, label=T,label.size=3.5, group.by='AstroAnnotations', cols = c("Astrocyte\nSubType 1"="#0ad1c6", "Astrocyte\nSubType 2"="#32f5ea","Astrocyte\nSubType 3"="#9dece8","Astrocyte\nSubType 4"="#078881"), repel=T) + NoLegend()+ ggtitle(NULL)
+
+
+Idents(astros) <- 'seurat_clusters'
+astros <- RenameIdents(astros, "0"="AST 1")
+astros <- RenameIdents(astros, "1"="AST 2")
+astros <- RenameIdents(astros, "2"="AST 3")
+astros <- RenameIdents(astros, "3"="AST 4")
+astros[['AstroAnnotations2']] <- Idents(object=astros)
+
+
+Idents(astros) <- 'AstroAnnotations2'
+counts <- table(Idents(astros), astros$samp)
+counts <- prop.table(counts, margin=2)*100
+#Organize the dataframe for easy plotting
+df <- as.data.frame.matrix(counts) 
+df$cluster <- rownames(df)
+df <- df %>% gather(., treatment, props, Control:Control, factor_key=T) 
+group.colors2 <- c("AST 1"="#0ad1c6", "AST 2"="#32f5ea","AST 3"="#9dece8","AST 4"="#078881")
+p3b <- ggplot(df, aes(x=treatment, y=props, fill=cluster, label=cluster)) + geom_bar(stat='identity', color='black') + theme_minimal() + labs(title='',x='',y='Percentage of cells', fill='Cluster:') + theme(text=element_text(size=15), axis.text.x = element_text(angle = 315, size=0)) + scale_fill_manual(values=group.colors2,labels = function(x) str_wrap(x, width = 15)) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))+ NoLegend()+
+  geom_text(size = 2, position = position_stack(vjust = 0.5))
+
+astro_genes <- c('Sox6','Nckap5','Kcnip4','Nrg3','Fn1','Tek','Syp','Celsr2')
+ordered_level <- c("Astrocyte\nSubType 1","Astrocyte\nSubType 2","Astrocyte\nSubType 3","Astrocyte\nSubType 4")
+astros@meta.data$AstroAnnotations <- factor(x=astros@meta.data$AstroAnnotations,levels=ordered_level)
+p3c <- VlnPlot(astros, features=c(astro_genes), stack=TRUE, sort=FALSE, flip=TRUE,group.by='AstroAnnotations',cols=c("Astrocyte\nSubType 1"="#0ad1c6", "Astrocyte\nSubType 2"="#32f5ea","Astrocyte\nSubType 3"="#9dece8","Astrocyte\nSubType 4"="#078881"), fill.by='ident') + theme(legend.position='none') + labs(title='',x='') + theme(text=element_text(size=15),axis.text.x =element_text(size=9),axis.title.x = element_blank())+scale_x_discrete(labels=function(x) str_wrap(x, width = 15))
+  
+
+title <- ggdraw() + 
+  draw_label(
+    "Figure 3",
+    fontface = 'bold',
+    x = 0,
+    hjust = 0,
+    size=20
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+
+
+botplots <- cowplot::plot_grid(
+  cowplot::plot_grid(NULL,p3c,NULL,ncol=3, rel_widths = c(0.1, 0.8, 0.1)),
+  cowplot::plot_grid(NULL,p3b,NULL,ncol=3, rel_widths = c(0.1, 0.8, 0.1)),
+  ncol=2, labels=c('B'), 
+  rel_widths=c(0.6,0.4)
+)
+
+plots <- cowplot::plot_grid(cowplot::plot_grid(NULL,p3a,NULL,ncol=3, rel_widths = c(0.1, 0.8, 0.1),labels=c("A")), botplots, ncol=1, rel_heights=c(1,1))
+f3 <- cowplot::plot_grid(title, plots, ncol=1, rel_heights=c(0.1,1))
+
+f3plot <- cowplot::plot_grid(p3a, p3c,p3b, labels=c('A','B'), ncol=3, rel_widths=c(0.8, 0.6, 0.4)) 
+
+
+###########################################################
+# Figure 4
+## 4A: Astros Upset (maybe venn?)
+## 4B: Bubble plot
+
+clust0 <- read.csv('./ORA_astros/GO/BP/cluster_0_GO_BP_ORA.csv', header=T, row.names = 1,stringsAsFactors = FALSE)
+clust0$Cluster <- c('Astrocyte SubType 1')
+
+clust1 <- read.csv('./ORA_astros/GO/BP/cluster_1_GO_BP_ORA.csv', header=T, row.names = 1,stringsAsFactors = FALSE)
+clust1$Cluster <- c('Astrocyte SubType 2')
+
+clust2 <- read.csv('./ORA_astros/GO/BP/cluster_2_GO_BP_ORA.csv', header=T, row.names = 1,stringsAsFactors = FALSE)
+clust2$Cluster <- c('Astrocyte SubType 3')
+
+clust3 <- read.csv('./ORA_astros/GO/BP/cluster_3_GO_BP_ORA.csv', header=T, row.names = 1)
+clust3$Cluster <- c('Astrocyte SubType 4')
+
+merged <- bind_rows(clust0, clust1, clust2, clust3)
+golist <- c('synapse assembly','regulation of synapse organization','cell junction assembly','regulation of synapse structure or activity','signal release from synapse','neurotransmitter secretion','vesicle-mediated transport in synapse','synaptic vesicle cycle','regulation of neurotransmitter transport','synaptic transmission, glutamatergic','regulation of synaptic plasticity','learning or memory','cognition','axonogenesis','regulation of myelination','oligodendrocyte differentiation','vasculogenesis','regulation of angiogenesis','regulation of voltage-gated calcium channel activity','synaptic membrane adhesion','presynaptic endocytosis','synaptic vesicle recycling')
+
+merged <- merged[merged$Description %in% golist,]
+
+p4b <- ggplot(merged, aes(x=Cluster, y=Description, size=Count,color=p.adjust, group=Cluster)) + geom_point(alpha=0.8) + theme_classic()+scale_color_gradient(low = "red2",  high = "mediumblue", space = "Lab")+scale_size(range = c(2, 8)) + scale_y_discrete(labels=function(x) str_wrap(x, width = 25))+ scale_x_discrete(labels=function(x) str_wrap(x, width = 10))+ theme(axis.title.x = element_blank()) + ylab('GO Terms')
+
+library(UpSetR)
+upsets <- list()
+upsets[['Astrocyte\nSubType 1']] <- clust0$Description
+upsets[['Astrocyte\nSubType 2']] <- clust1$Description
+upsets[['Astrocyte\nSubType 3']] <- clust2$Description
+upsets[['Astrocyte\nSubType 4']] <- clust3$Description
+
+p4a <- upset(fromList(upsets), nsets=15, order.by='freq',text.scale=c(2,2,2,2,2,2),
+     point.size=6,
+     line.size=4,
+     mainbar.y.label='Significant GO pathway intersections', sets.x.label='Significant GO pathways')
+
+library(VennDiagram)
+venn <- venn.diagram(
+  upsets,
+  fill=c("#0ad1c6","#32f5ea","#9dece8","#078881"),
+  lwd=1,
+  lty=1,
+  cat.cex=1,
+  cex=1.5,
+  alpha=1,
+  filename=NULL
+)
+
+title <- ggdraw() + 
+  draw_label(
+    "Figure 4",
+    fontface = 'bold',
+    x = 0,
+    hjust = 0,
+    size=20
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+
+plots <- cowplot::plot_grid(venn,p4b, ncol=2, rel_widths=c(0.5,0.5), labels = c("A","B"))
+f4 <- cowplot::plot_grid(title, plots, ncol=1, rel_heights=c(0.1,1))
+
+pdf('./figure1.pdf',height=8, width=12)
+print(f1)
+dev.off()
+
+pdf('./figure2.pdf',height=8, width=12)
+print(f2)
+dev.off()
+
+pdf('./figure3.pdf',height=8, width=6)
+print(f3)
+dev.off()
+
+pdf('./figure3_horizontal.pdf',height=4, width=20)
+print(f3plot)
+dev.off()
+
+pdf('./figure4.pdf',height=8, width=12)
+print(f4)
+dev.off()
+
+f1
+f2
+f3
+f4
+```
+
+```{r SessionInfo}
+sessionInfo()
+```
