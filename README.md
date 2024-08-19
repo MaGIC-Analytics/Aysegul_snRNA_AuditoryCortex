@@ -19,7 +19,7 @@ This will run an Rstudio instance on your local machine using our prebuilt docke
 Then you can follow along with the rmarkdown file provided. 
 
 ## Input Data
-Input data was raw .h5 matrices generated from cellranger v6. Raw fastq files and raw .h5 matrices can be found at the Gene Expression Omnibus at accession [GSE262970](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE262970)
+Input data was raw cell x gene matrices generated from Parse split-pipe v1.0.4. Raw fastq files and raw matrices can be found at the Gene Expression Omnibus at accession [GSE262970](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE262970)
 
 ## Data exploration
 For ease, this data has also been built into a containerized RShiny image that can be launched on a local machine. To do so, you must have [docker](https://www.docker.com/) installed locally. Once installed, this can be launched:
